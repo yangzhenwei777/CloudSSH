@@ -23,15 +23,27 @@ try {
   execFileSync(process.execPath, ['scripts/sync-theme-editor.js'], { cwd: rootDir, stdio: 'inherit' });
   // Dependencies are installed explicitly by developers/CI. Keeping installs out
   // of the build makes production artifacts deterministic and offline-buildable.
-  const executableSuffix = process.platform === 'win32' ? '.cmd' : '';
-  execFileSync(path.join(frontendDir, 'node_modules', '.bin', `tsc${executableSuffix}`), [], {
-    cwd: frontendDir,
-    stdio: 'inherit',
-  });
-  execFileSync(path.join(frontendDir, 'node_modules', '.bin', `vite${executableSuffix}`), ['build'], {
-    cwd: frontendDir,
-    stdio: 'inherit',
-  });
+  // Windows 沙箱下 .bin/*.cmd 不能由 execFileSync 直接执行，改用 Node 调包内 JS 入口。
+  // 其他平台保留原有的 .bin 调用方式，构建产物保持一致。
+  if (process.platform === 'win32') {
+    execFileSync(process.execPath, [path.join(frontendDir, 'node_modules', 'typescript', 'bin', 'tsc')], {
+      cwd: frontendDir,
+      stdio: 'inherit',
+    });
+    execFileSync(process.execPath, [path.join(frontendDir, 'node_modules', 'vite', 'bin', 'vite.js'), 'build'], {
+      cwd: frontendDir,
+      stdio: 'inherit',
+    });
+  } else {
+    execFileSync(path.join(frontendDir, 'node_modules', '.bin', 'tsc'), [], {
+      cwd: frontendDir,
+      stdio: 'inherit',
+    });
+    execFileSync(path.join(frontendDir, 'node_modules', '.bin', 'vite'), ['build'], {
+      cwd: frontendDir,
+      stdio: 'inherit',
+    });
+  }
 
   console.log('Inlining assets...');
   // 2. Read dist/index.html

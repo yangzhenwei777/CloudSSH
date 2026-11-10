@@ -149,7 +149,7 @@ export function isConnectTokenRouteAllowed(mode: AuthMode, routeKey: string): bo
 export function resolveAuthMode(env: Env, request?: Request): AuthMode {
   const hash = env.ADMIN_PASSWORD_HASH;
   if (hash !== undefined && hash.trim() !== '') return 'password';
-  if ((request && accessIdentities.has(request)) || env.CF_ACCESS === 'true') {
+  if (env.CF_ACCESS === 'true') {
     return 'cf_access';
   }
   if (env.GITHUB_CLIENT_ID && env.GITHUB_CLIENT_SECRET) return 'github';
