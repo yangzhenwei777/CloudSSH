@@ -16,6 +16,7 @@ tests/
 ├── agent-session-draft.test.ts # Agent 草稿用户命名空间、旧格式清理与退出清理
 ├── agent-terminal-selection.test.ts # 终端选区附件和非授权安全边界
 ├── api-errors.test.ts          # API 错误信息边界与状态码
+├── app-bootstrap.test.ts      # 首屏配置/身份并行读取、失败关闭与共享超时清理
 ├── auth-challenge-dialog.test.ts # RFC 4256 认证挑战对话框交互
 ├── clipboard.test.ts              # Clipboard API 与旧版复制回退
 ├── editor-content.test.ts         # 在线编辑内容解码、BOM/换行符与嗅探
@@ -86,7 +87,49 @@ pnpm run verify
 - 业务接口与所有 PUT/POST/DELETE 必须在触发交互前显式 Mock，并核对请求方法、路径/参数、载荷和结果。页面级 `page.route()` 优先于 context 默认值；不处理的方法应 `route.fallback()`，不能统一返回成功。
 - 未声明的 API 会被中止并记录。即使应用 `catch` 后继续运行，fixture 清理阶段仍令测试失败，报告中附 `unmocked-api-requests`，只记录方法和路径，不记录查询值/正文/凭据。手工创建独立 context 时应调用 `installApiMocks()` 并在关闭后检查其守卫。
 - Playwright 始终启动全新 `--mode e2e --strictPort` Vite，不复用普通开发服务器；4173 被占用时明确失败，不漂移端口。E2E 不运行 8787 后端；漏到服务器的 `/api` 请求返回带标记的 **501 JSON**，而不是 SPA 的 **200 HTML**，页面 `route.continue()` 的绕过也会被守卫识别。普通开发仍保留 Worker 代理。
-- E2E 验证不能只查控制台是否有 `ECONNREFUSED`：须确认测试退出码、守卫检查和完整 stdout/stderr。比较耗时时保持机器、浏览器项目、worker 数和重试设置一致。
+- E2E 验证不能只查控制台是否有 `ECONNREFUSED`：须确认测试退出码、守卫检查和完整 stdout/stderr。常规耗时比较须保持机器、浏览器项目、worker 数和重试设置一致；评估并发变更时仅改变 worker 数，并分别保留报告。
+
+## 首屏加载与强制登录回归
+
+- `app-bootstrap.test.ts` 验证配置和身份请求并行、仅 401 代表未登录、无效配置/身份拒绝、失败取消另一请求、10s 请求/正文超时，以及重试重新读取而非沿用旧策略。
+- `e2e/app-bootstrap.spec.ts` 在 Chromium 和 WebKit 移动端覆盖脚本尚未加载的初始 HTML、两个接口的不同完成顺序与刷新；通过 MutationObserver 确认强制登录期间从未创建匿名连接表单，而非仅验证最终截图。
+- 浏览器测试还覆盖已登录页面、HTTP/网络/JSON 失败、超时与迟到响应、单次重试、三语/主题/减少动态、分享认领绕过加载和配置失败时仍可使用的密码设置路由。使用受控 Promise 和浏览器时钟，不以机器相关毫秒数作为闪烁门禁。
+
+## E2E CI 并发与报告
+
+- `deploy.yml` 对 test/main 的 push、目标为 test/main 的 PR 和手动触发执行完整验证；只有 push 可按 test/main 分流部署。PR 和手动验证不注入 Cloudflare Secrets，保留 job 级 repository_owner 限制；不使用 `pull_request_target`。
+- 类型检查、单元测试与构建先于浏览器安装，以尽早失败；不删测试或减少浏览器。Worker CI 仅取消同 PR 的过期验证，不中断部署，job 上限 30 分钟。互操作 CI 允许取消旧运行，Pages 发布串行执行。
+
+- CI 默认使用 **2 个 worker**，本地默认并发仍由 Playwright 决定。所有 Chromium / WebKit 项目及用例范围不变；CI 保留最多 2 次重试、首次重试记录 trace、失败时截图，不启用全程 trace 或录像。
+- CI 生成 `playwright-report/index.html` 与 `test-results/results.json`。`deploy.yml` 在 E2E 实际执行成功或失败后、部署密钥注入前，将 `playwright-report/` 与 `test-results/` 一并上传，保留 **7 天**；取消或 E2E 未执行时不上传。报告名包含 run ID 与运行尝试编号，避免重跑时覆盖或 PR ref 的斜杠导致非法名称；启动失败且尚无文件时只警告，但原测试失败仍阻止部署。
+- 在 Actions 对应运行的 **Artifacts** 中下载 `playwright-report-<run-id>-<attempt>`。解压后运行 `pnpm exec playwright show-report <解压目录>/playwright-report` 查看每条用例、耗时、重试和附件；JSON 中的 `stats` / `suites` 可用于汇总与分文件分析。报告包含测试页面及模拟数据，请勿在 E2E 中使用真实凭据。
+- E2E 不设置 `continue-on-error`；上传报告成功不代表测试成功。任一门禁失败仍阻断部署，部署沿用已验证的同一份前端产物，不在配置部署 Secrets 后重新构建。
+
+```bash
+# 单 worker 对照 / 排查并发问题（也可将 CI 配置回退为 1）
+CI=true pnpm exec playwright test --workers=1
+
+# 两 worker 验证；每次运行会重建报告，比较前请先另存上一份
+CI=true pnpm exec playwright test --workers=2
+```
+
+基线参考：v2.10.3 的 457 项浏览器用例（456 通过、1 跳过），单 worker 的 [main CI](https://github.com/newbietan/CloudSSH/actions/runs/42570709206) 为 17 分 06 秒，[test CI](https://github.com/newbietan/CloudSSH/actions/runs/42570913350) 为 16 分 46 秒；这不是其他机器的固定时长。两 worker 应在同类 runner、相同浏览器版本与用例范围下观察多轮耗时、重试/偶发失败及 OOM。收益不足或出现新增竞态时回退单 worker，保留报告能力；不削减覆盖、放宽超时或跳过失败来换速度。
+
+## 个人 MCP 接入回归
+
+- `tests/worker/mcp.test.ts`：真实官方 MCP Client 初始化/列工具/调用、唯一配置的AES-GCM回读、幂等并发生成、永久稳定令牌、旧摘要迁移、逐服务器授权/清空权限、认证模式与请求/活动预算。通过真实 Worker 入口验证 Access 机器准入：用户资料缺失/异常/悬挂不阻断 MCP，也不触发身份查询；错误 Token、无原生上下文、伪造头和非法 aud 仍拒绝。
+- `tests/worker/cf-access.test.ts`：区分原生准入与浏览器身份，只有精确 `/mcp` 跳过资料读取；配置管理/凭据导出/CA 签发仍要求有效邮箱，缺失/异常不回退 GitHub，请求克隆/重新初始化不继承旧准入。
+- `tests/worker/mcp-auth-diagnostics.test.ts`：固定认证拒绝原因码、DEBUG 默认关闭、每 isolate 每60秒20条日志上限及时间回退，不记录凭据/身份/上游正文，429预算响应不误报为凭据失效。
+- `mcp-execution.test.ts`：严格验签与无头连接、配置变化重建、短连接复用、并发拒绝、取消、撤销复查、隧道重定向/解析地址防护和 Alarm 清理。
+- `mcp-context.test.ts` / `mcp-ssh-channels.test.ts`：标签页显式共享的所有者/路由/服务器隔离、到期/断线失效、不刷新空闲，以及独立 subsystem 与 exec 超时清理。
+- `mcp-sftp.test.ts`：UTF-8 字节边界、二进制拒绝、目录预算、临时文件创建时显式 0600、哈希冲突与原子替换；真实 Streams 模拟 INIT 写入失败，检查版本等待无未处理拒绝、流锁和计时器清理。`ssh/sftp-protocol.test.ts` 验证 OPEN 权限属性的报文字节与省略权限时的兼容性。
+- `tests/e2e/mcp.spec.ts` / `mcp-access.spec.ts`：Chromium / WebKit 移动端三语界面、唯一配置生成/重复复制/保存逐服务器权限、显式共享/停止、匿名隐藏和axe；Access精简引导与加密保存后的显式回读、明文不进浏览器存储、关闭/模式切换清理，四主题共享Agent/MCP组件的标题/输入/页脚尺寸与材料一致性、无改动/恢复/保存/复制/失败的按钮状态及默认折叠日志；三语与 320/375/380/381/390/520px 下的 Agent 返回按钮检查单行文字/极窄屏箭头、完整无障碍名称、触摸目标、标题栏不溢出及原关闭行为。
+- `mcp-config-draft.test.ts`：授权集合顺序不构成修改，逐服务器变化/撤销授权/恢复原值比较，不改变原始基线。
+- `tests/worker/mcp-management.test.ts`：元数据与显式POST导出分离、权限更新失效旧连接池、无DELETE/旧令牌接口、所有者鉴权。
+- `mcp-client-config.test.ts`：普通模式只生成 Bearer，Access 添加独立的两个请求头，凭据格式/大小边界和固定 SVG 几何；`agent-responses.spec.ts` 覆盖助手 SVG 与完成/取消/恢复状态切换。
+- 显式 `CLOUDSSH_SSHD_INTEROP=1 pnpm exec vitest run tests/interop/sshd.test.ts` 还验证真实 OpenSSH 上的无 Shell exec、独立 SFTP 创建/读取/原子替换；不改系统 SSH 配置。
+
+详见 [MCP 接入和限制](../docs/mcp.md)。协议测试不等同于所有 Claude Code/Cursor 版本的实机验证；Access 边缘准入与实际 Cloudflare 部署需单独验证。
 
 ## 当前覆盖范围
 

@@ -1,6 +1,7 @@
 import { AIConfigPanel } from './ai-config';
 import { openAdminHashGeneratorDialog } from './admin-hash-generator';
 import { ConnectionForm } from './auth-form';
+import { type AppConfig, type InitialUser, loadInitialAppState } from './app-bootstrap';
 import { clearLegacyAgentSessionDrafts, clearUserAgentSessionDrafts } from './agent/session-draft';
 import { initI18n, onLocaleChange, t } from './i18n';
 import { MobileTerminalController } from './mobile-terminal';
@@ -29,11 +30,14 @@ import { customThemeModal, customThemeStore } from './custom-theme-manager';
 import { requestCloudflareSshCertificate } from './cf-ssh-ca';
 import { notify } from './ui-feedback';
 import { initVersionNotice } from './version-notice';
+import { McpManager } from './mcp-manager';
+import { mountAssistantIcons } from './assistant-icons';
 
 // ==================== 全局状态 ====================
 
 let tabManager: TabManager | null = null;
 let connectionForm: ConnectionForm | null = null;
+let appConfig: AppConfig | null = null;
 let serverList: ServerList | null = null;
 let isLoggedIn = false;
 let currentGithubId: number | null = null;
@@ -47,6 +51,13 @@ const snippetManager = new SnippetManager({
   getTerminal: () => tabManager?.getActiveTab()?.terminal ?? null,
   isAuthenticated: () => isLoggedIn && !sharedSessionMode,
   onStateChange: () => syncDrawerSegmentedControl(),
+});
+
+const mcpManager = new McpManager(() => {
+  if (!isLoggedIn || sharedSessionMode) return null;
+  const tab = tabManager?.getActiveTab();
+  const session = tab?.terminal.getMcpSession();
+  return tab && session ? { ...session, label: tab.label } : null;
 });
 
 function setUserSpaceMenuOpen(open: boolean): void {
@@ -260,6 +271,8 @@ function deactivateTerminalView(): void {
 }
 
 function showAuthSection(): void {
+  mcpManager.setIdentity(null);
+  if (!appConfig) return;
   deactivateTerminalView();
   document.getElementById('auth-section')!.classList.remove('hidden');
   document.getElementById('user-space-section')!.classList.add('hidden');
@@ -275,19 +288,16 @@ function showAuthSection(): void {
 
   if (!connectionForm) {
     connectionForm = new ConnectionForm({
+      config: appConfig,
       getTabManager,
     });
   }
   syncConnectionBackButtons();
 }
 
-function showUserSpace(user: {
-  id: number;
-  github_id: number;
-  username: string;
-  avatar_url: string | null;
-}): void {
+function showUserSpace(user: InitialUser, config: AppConfig): void {
   deactivateTerminalView();
+  mcpManager.setIdentity(`${user.github_id}:${user.username}`, config.authMode);
   const previousGithubId = currentGithubId;
   isLoggedIn = true;
   currentGithubId = user.github_id;
@@ -326,7 +336,8 @@ function showUserSpace(user: {
     // onConnect 回调 — 在当前页面创建新标签
     (wsUrl: string, serverName: string, hostInfo?: SSHHostInfo) => {
       showTerminalFromServer(wsUrl, serverName, hostInfo);
-    }
+    },
+    config
   );
 }
 
@@ -977,7 +988,16 @@ function consumeAdminSetupRoute(): void {
   openAdminHashGeneratorDialog();
 }
 
+function finishAppLoading(): void {
+  const app = document.getElementById('app')!;
+  app.hidden = false;
+  app.removeAttribute('inert');
+  app.removeAttribute('aria-hidden');
+  document.getElementById('app-loading')?.remove();
+}
+
 async function init(): Promise<void> {
+  mountAssistantIcons();
   clearLegacyAgentSessionDrafts();
   initI18n();
   initUserSpaceMobileMenu();
@@ -1016,6 +1036,7 @@ async function init(): Promise<void> {
   const drawerBar = document.getElementById('terminal-drawer-segmented-bar');
   if (drawerBar) {
     initTerminalDrawerControl();
+  mcpManager.init();
   }
   initMobileDrawerButtons();
 
@@ -1052,6 +1073,7 @@ async function init(): Promise<void> {
   const shareToken = takeShareTokenFromLocation();
   if (shareToken) {
     renderShareLanding(shareToken, showSharedTerminal);
+    finishAppLoading();
     return;
   }
 
@@ -1061,6 +1083,7 @@ async function init(): Promise<void> {
   // 独立终端标签页模式：URL 包含 wsUrl 参数
   if (isTerminalTab()) {
     initTerminalTab();
+    finishAppLoading();
     return;
   }
 
@@ -1071,21 +1094,39 @@ async function init(): Promise<void> {
   consumeAdminSetupRoute();
   window.addEventListener('hashchange', consumeAdminSetupRoute);
 
-  try {
-    // 检查是否已登录
-    const meRes = await fetch('/api/auth/me');
-    if (meRes.ok) {
-      const user = await meRes.json();
-      showUserSpace(user);
-      void restoreCloudTheme(initialThemeSelection, themeSelectionRevision);
-      return;
+  const loadingStatus = document.getElementById('app-loading-status')!;
+  const loadingError = document.getElementById('app-loading-error')!;
+  const retryButton = document.getElementById('app-loading-retry') as HTMLButtonElement;
+  let loading = false;
+  const loadPage = async (): Promise<void> => {
+    if (loading) return;
+    loading = true;
+    retryButton.disabled = true;
+    loadingStatus.classList.remove('hidden');
+    loadingStatus.setAttribute('aria-busy', 'true');
+    loadingError.classList.add('hidden');
+    try {
+      const state = await loadInitialAppState();
+      appConfig = state.config;
+      if (state.user) {
+        showUserSpace(state.user, state.config);
+        void restoreCloudTheme(initialThemeSelection, themeSelectionRevision);
+      } else {
+        showAuthSection();
+      }
+      finishAppLoading();
+    } catch {
+      // Unknown configuration/authentication is not permission to show an anonymous form.
+      loadingStatus.classList.add('hidden');
+      loadingError.classList.remove('hidden');
+      retryButton.disabled = false;
+    } finally {
+      loadingStatus.setAttribute('aria-busy', 'false');
+      loading = false;
     }
-  } catch {
-    // /api/auth/me 失败，继续显示匿名连接表单
-  }
-
-  // 未登录 → 显示匿名连接表单
-  showAuthSection();
+  };
+  retryButton.addEventListener('click', () => void loadPage());
+  await loadPage();
 }
 
 // 导出供 auth-form、server-list 和测试套件使用
